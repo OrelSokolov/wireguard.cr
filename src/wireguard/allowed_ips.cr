@@ -149,7 +149,8 @@ module Wireguard
     end
 
     private def bit_at(ip : Bytes, i : Int32) : Int32
-      ((ip[i >> 3] >> (7 - (i & 7))) & 1).to_i32
+      # unchecked read: hot path (routing lookup per packet)
+      ((ip.to_unsafe[i >> 3] >> (7 - (i & 7))) & 1).to_i32
     end
   end
 end

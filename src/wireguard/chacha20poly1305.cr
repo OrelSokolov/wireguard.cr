@@ -15,6 +15,7 @@ module Wireguard
     @[Link("crypto")]
     lib Evp
       fun EVP_chacha20_poly1305 : Void*
+      fun EVP_CIPHER_fetch(ctx : Void*, algorithm : UInt8*, properties : UInt8*) : Void*
       fun EVP_CIPHER_CTX_new : Void*
       fun EVP_CIPHER_CTX_free(ctx : Void*)
       fun EVP_EncryptInit_ex(ctx : Void*, cipher : Void*, impl : Void*, key : UInt8*, iv : UInt8*) : Int32
@@ -29,62 +30,83 @@ module Wireguard
     private CTRL_AEAD_GET_TAG = 0x10
     private CTRL_AEAD_SET_TAG = 0x11
 
-    def self.seal(key : Bytes, nonce : Bytes, plaintext : Bytes, aad : Bytes?) : Bytes
-      ctx = Evp.EVP_CIPHER_CTX_new
-      raise OpenError.new("ctx_new failed") if ctx.null?
-      begin
-        rc = Evp.EVP_EncryptInit_ex(ctx, Evp.EVP_chacha20_poly1305, nil, key, nonce)
-        raise OpenError.new("encrypt_init failed") if rc != 1
-        outl = 0
-        if aad && !aad.empty?
-          rc = Evp.EVP_EncryptUpdate(ctx, nil, pointerof(outl), aad, aad.size)
-          raise OpenError.new("aad failed") if rc != 1
-        end
-        ct = Bytes.new(plaintext.size)
-        if plaintext.size > 0
-          rc = Evp.EVP_EncryptUpdate(ctx, ct, pointerof(outl), plaintext, plaintext.size)
-          raise OpenError.new("update failed") if rc != 1
-        end
-        fin = Bytes.new(16)
-        rc = Evp.EVP_EncryptFinal_ex(ctx, fin, pointerof(outl))
-        raise OpenError.new("final failed") if rc != 1
-        tag = Bytes.new(TAG_SIZE)
-        rc = Evp.EVP_CIPHER_CTX_ctrl(ctx, CTRL_AEAD_GET_TAG, TAG_SIZE, tag)
-        raise OpenError.new("get_tag failed") if rc != 1
-        ct + tag
-      ensure
-        Evp.EVP_CIPHER_CTX_free(ctx)
+    # pooled contexts: created once, re-initialized per call (cooperative
+    # scheduler, no yields inside, so a single shared ctx is safe).
+    # The cipher is fetched once through the OpenSSL 3 provider path — the
+    # static EVP_chacha20_poly1305 handle routes through the legacy path,
+    # which is noticeably slower.
+    @@cipher : Void* = Evp.EVP_CIPHER_fetch(nil, "chacha20-poly1305", nil)
+    @@enc_ctx : Void* = Evp.EVP_CIPHER_CTX_new
+    @@dec_ctx : Void* = Evp.EVP_CIPHER_CTX_new
+
+    # Encrypts into dst at offset: ciphertext followed by the 16-byte tag.
+    # Returns the number of bytes written (plaintext.size + TAG_SIZE).
+    def self.seal_into(dst : Bytes, offset : Int32, key : Bytes, nonce : Bytes,
+                       plaintext : Bytes, aad : Bytes?) : Int32
+      raise OpenError.new("ctx_new failed") if @@enc_ctx.null?
+      rc = Evp.EVP_EncryptInit_ex(@@enc_ctx, @@cipher, nil, key, nonce)
+      raise OpenError.new("encrypt_init failed") if rc != 1
+      outl = 0
+      if aad && !aad.empty?
+        rc = Evp.EVP_EncryptUpdate(@@enc_ctx, nil, pointerof(outl), aad, aad.size)
+        raise OpenError.new("aad failed") if rc != 1
       end
+      outp = dst.to_unsafe + offset
+      if plaintext.size > 0
+        rc = Evp.EVP_EncryptUpdate(@@enc_ctx, outp, pointerof(outl), plaintext, plaintext.size)
+        raise OpenError.new("update failed") if rc != 1
+      end
+      fin = uninitialized UInt8[16]
+      rc = Evp.EVP_EncryptFinal_ex(@@enc_ctx, fin, pointerof(outl))
+      raise OpenError.new("final failed") if rc != 1
+      rc = Evp.EVP_CIPHER_CTX_ctrl(@@enc_ctx, CTRL_AEAD_GET_TAG, TAG_SIZE, outp + plaintext.size)
+      raise OpenError.new("get_tag failed") if rc != 1
+      plaintext.size + TAG_SIZE
+    end
+
+    def self.seal(key : Bytes, nonce : Bytes, plaintext : Bytes, aad : Bytes?) : Bytes
+      res = Bytes.new(plaintext.size + TAG_SIZE)
+      seal_into(res, 0, key, nonce, plaintext, aad)
+      res
+    end
+
+    # Decrypts ct_and_tag into dst (must have room for ct_and_tag.size -
+    # TAG_SIZE bytes). Returns the plaintext length, or nil on authentication
+    # failure (like Go's aead.Open).
+    def self.open_into(dst : Bytes, key : Bytes, nonce : Bytes,
+                       ct_and_tag : Bytes, aad : Bytes?) : Int32?
+      return nil unless ct_and_tag.size >= TAG_SIZE
+      return nil if @@dec_ctx.null?
+      rc = Evp.EVP_DecryptInit_ex(@@dec_ctx, @@cipher, nil, key, nonce)
+      return nil if rc != 1
+      outl = 0
+      if aad && !aad.empty?
+        rc = Evp.EVP_DecryptUpdate(@@dec_ctx, nil, pointerof(outl), aad, aad.size)
+        return nil if rc != 1
+      end
+      ct_len = ct_and_tag.size - TAG_SIZE
+      if ct_len > 0
+        rc = Evp.EVP_DecryptUpdate(@@dec_ctx, dst.to_unsafe, pointerof(outl),
+          ct_and_tag.to_unsafe, ct_len)
+        return nil if rc != 1
+      end
+      rc = Evp.EVP_CIPHER_CTX_ctrl(@@dec_ctx, CTRL_AEAD_SET_TAG, TAG_SIZE,
+        ct_and_tag.to_unsafe + ct_len)
+      return nil if rc != 1
+      fin = uninitialized UInt8[16]
+      rc = Evp.EVP_DecryptFinal_ex(@@dec_ctx, fin, pointerof(outl))
+      return nil if rc != 1
+      ct_len
     end
 
     # Returns nil on authentication failure (like Go's aead.Open).
     def self.open(key : Bytes, nonce : Bytes, ciphertext_and_tag : Bytes, aad : Bytes?) : Bytes?
       return nil unless ciphertext_and_tag.size >= TAG_SIZE
-      tag = ciphertext_and_tag[ciphertext_and_tag.size - TAG_SIZE, TAG_SIZE]
-      ct = ciphertext_and_tag[0, ciphertext_and_tag.size - TAG_SIZE]
-      ctx = Evp.EVP_CIPHER_CTX_new
-      return nil if ctx.null?
-      begin
-        rc = Evp.EVP_DecryptInit_ex(ctx, Evp.EVP_chacha20_poly1305, nil, key, nonce)
-        return nil if rc != 1
-        outl = 0
-        if aad && !aad.empty?
-          rc = Evp.EVP_DecryptUpdate(ctx, nil, pointerof(outl), aad, aad.size)
-          return nil if rc != 1
-        end
-        pt = Bytes.new(ct.size)
-        if ct.size > 0
-          rc = Evp.EVP_DecryptUpdate(ctx, pt, pointerof(outl), ct, ct.size)
-          return nil if rc != 1
-        end
-        rc = Evp.EVP_CIPHER_CTX_ctrl(ctx, CTRL_AEAD_SET_TAG, TAG_SIZE, tag)
-        return nil if rc != 1
-        fin = Bytes.new(16)
-        rc = Evp.EVP_DecryptFinal_ex(ctx, fin, pointerof(outl))
-        return nil if rc != 1
-        pt
-      ensure
-        Evp.EVP_CIPHER_CTX_free(ctx)
+      res = Bytes.new(ciphertext_and_tag.size - TAG_SIZE)
+      if open_into(res, key, nonce, ciphertext_and_tag, aad)
+        res
+      else
+        nil
       end
     end
 

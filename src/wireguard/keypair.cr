@@ -15,10 +15,12 @@ module Wireguard
     getter created_at : Time::Span = Time.monotonic
     getter local_index : UInt32
     getter remote_index : UInt32
+    getter peer : Peer?
     property send_nonce : UInt64 = 0
 
     def initialize(@send_key : Bytes, @receive_key : Bytes,
-                   @is_initiator : Bool, @local_index : UInt32, @remote_index : UInt32)
+                   @is_initiator : Bool, @local_index : UInt32, @remote_index : UInt32,
+                   @peer : Peer? = nil)
     end
   end
 end

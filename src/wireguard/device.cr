@@ -18,8 +18,16 @@ module Wireguard
   # sender's reply address) and a send-by-address operation. Implementations:
   # MemBind (in-process router) and UdpBind (real UDP sockets).
   module Bind
-    abstract def inbox : Channel(MemBind::Packet)
+    # Blocking receive of one datagram. Implementations that receive
+    # synchronously (UdpBind) may reuse an internal buffer, valid only until
+    # the next call — the device pipeline copies out anything it keeps.
+    abstract def next_packet? : MemBind::Packet?
+
     abstract def send(dst : String, data : Bytes) : Nil
+
+    def inbox : Channel(MemBind::Packet)
+      raise "this bind receives via next_packet?"
+    end
 
     def start : Nil
     end
@@ -45,6 +53,10 @@ module Wireguard
       @inbox = Channel(Packet).new(256)
       @router = router
       router.register(self)
+    end
+
+    def next_packet? : Packet?
+      inbox.receive?
     end
 
     def send(dst : String, data : Bytes) : Nil
@@ -85,6 +97,11 @@ module Wireguard
   end
 
   class Device
+    # hot-path scratch, shared per process: Crystal fibers are cooperative and
+    # none of the transport code yields while using these
+    @@nonce_scratch = Bytes.new(12)
+    @@pt_scratch = Bytes.new(65536) # transport plaintext (padded)
+
     getter sk : Bytes = Bytes.new(32)   # static private key
     getter pk : Bytes = Bytes.new(32)   # static public key
     getter peers : Hash(Bytes, Peer) = {} of Bytes => Peer
@@ -340,7 +357,7 @@ module Wireguard
       peer.local_ephemeral = Bytes.new(32)
       peer.state = :zeroed
 
-      kp = Keypair.new(send_key, recv_key, is_initiator, peer.local_index, peer.remote_index)
+      kp = Keypair.new(send_key, recv_key, is_initiator, peer.local_index, peer.remote_index, peer)
       swap_index_for_keypair(peer.local_index, kp)
       peer.local_index = 0
 
@@ -393,7 +410,7 @@ module Wireguard
 
     private def receive_loop(bind : Bind) : Nil
       while @up
-        pkt = bind.inbox.receive?
+        pkt = bind.next_packet?
         break unless pkt
         handle_datagram(pkt.from, pkt.data)
       end
@@ -473,56 +490,50 @@ module Wireguard
       kp = entry.keypair
       return unless kp
 
-      nonce = Bytes.new(12)
+      nonce = @@nonce_scratch
       IO::ByteFormat::LittleEndian.encode(counter, nonce[4, 8])
-      content = ChaCha20Poly1305.open(kp.receive_key, nonce, data[16..], nil)
-      return unless content
+      pt = @@pt_scratch
+      content_len = ChaCha20Poly1305.open_into(pt, kp.receive_key, nonce, data[16..], nil)
+      return unless content_len
 
-      peer = peer_for_keypair(kp)
+      peer = kp.peer
       return unless peer
 
       # rx accounting happens for every authenticated packet, then the
       # replay filter runs (order mirrors wireguard-go: validate, account)
       return unless kp.replay_filter.validate_counter(counter, Keypair::REJECT_AFTER_MESSAGES)
-      peer.rx_bytes &+= content.size + 32
+      peer.rx_bytes &+= content_len + 32
 
       peer.received_with_keypair(kp)
       peer.endpoint = src
 
-      if ENV["WG_DEBUG"]?
-        STDERR.puts "DBG transport: peer=#{peer.object_id} content=#{content.size} v#{content[0] >> 4}"
-      end
-      return if content.empty? # keepalive
+      return if content_len == 0 # keepalive
 
-      deliver = case content[0] >> 4
+      content = Bytes.empty
+      ver = pt.unsafe_fetch(0) >> 4
+      deliver = case ver
                 when 4
-                  return false_flag unless content.size >= 20
-                  length = IO::ByteFormat::BigEndian.decode(UInt16, content[2, 2]).to_i32
-                  return if length > content.size || length < 20
-                  content = content[0, length]
+                  return false_flag unless content_len >= 20
+                  length = IO::ByteFormat::BigEndian.decode(UInt16, pt[2, 2]).to_i32
+                  return if length > content_len || length < 20
+                  # the delivered packet escapes to the tun reader: fresh copy
+                  content = pt[0, length].dup
                   @allowedips.lookup(content[12, 4]) == peer
                 when 6
-                  return false_flag unless content.size >= 40
-                  length = IO::ByteFormat::BigEndian.decode(UInt16, content[4, 2]).to_i32 + 40
-                  return if length > content.size
-                  content = content[0, length]
+                  return false_flag unless content_len >= 40
+                  length = IO::ByteFormat::BigEndian.decode(UInt16, pt[4, 2]).to_i32 + 40
+                  return if length > content_len
+                  content = pt[0, length].dup
                   @allowedips.lookup(content[8, 16]) == peer
                 else
                   false
                 end
-      if ENV["WG_DEBUG"]?
-        STDERR.puts "DBG deliver=#{deliver}"
-      end
       return unless deliver
       @tun_channels.inbound.send(content)
     end
 
     private def false_flag
       false
-    end
-
-    private def peer_for_keypair(kp : Keypair) : Peer?
-      @peers.each_value.find { |p| p.current_keypair == kp || p.next_keypair == kp || p.previous_keypair == kp }
     end
 
     def send_handshake_message(peer : Peer, bytes : Bytes) : Nil
@@ -541,19 +552,24 @@ module Wireguard
       nonce_counter = kp.send_nonce
       kp.send_nonce &+= 1
 
+      # one allocation per packet: header + padded ciphertext + tag
       pad = calculate_padding_size(content.size, @tun_channels.mtu)
-      padded = Bytes.new(content.size + (pad > 0 ? pad : 0))
-      content.copy_to(padded)
+      padded_len = content.size + pad
+      packet = Bytes.new(Messages::MESSAGE_TRANSPORT_HEADER_SIZE + padded_len + ChaCha20Poly1305::TAG_SIZE)
 
-      header = Bytes.new(Messages::MESSAGE_TRANSPORT_HEADER_SIZE)
-      IO::ByteFormat::LittleEndian.encode(Messages::MESSAGE_TRANSPORT_TYPE, header[0, 4])
-      IO::ByteFormat::LittleEndian.encode(kp.remote_index, header[4, 4])
-      IO::ByteFormat::LittleEndian.encode(nonce_counter, header[8, 8])
+      IO::ByteFormat::LittleEndian.encode(Messages::MESSAGE_TRANSPORT_TYPE, packet[0, 4])
+      IO::ByteFormat::LittleEndian.encode(kp.remote_index, packet[4, 4])
+      IO::ByteFormat::LittleEndian.encode(nonce_counter, packet[8, 8])
 
-      nonce = Bytes.new(12)
+      pt = @@pt_scratch
+      content.copy_to(pt)
+      packet[16 + padded_len, pad].fill(0) if pad > 0
+
+      nonce = @@nonce_scratch
       IO::ByteFormat::LittleEndian.encode(nonce_counter, nonce[4, 8])
-      sealed = ChaCha20Poly1305.seal(kp.send_key, nonce, padded, nil)
-      packet = header + sealed
+      ChaCha20Poly1305.seal_into(packet, Messages::MESSAGE_TRANSPORT_HEADER_SIZE,
+        kp.send_key, nonce, pt[0, padded_len], nil)
+
       peer.tx_bytes &+= packet.size
       peer.endpoint.try do |ep|
         @bind.try(&.send(ep, packet))
