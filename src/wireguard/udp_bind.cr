@@ -18,8 +18,15 @@ module Wireguard
     @last_addr : Socket::IPAddress?
     @addr_cache : Hash(String, Socket::IPAddress)
 
-    def initialize(port : UInt16 = 0, @name : String = "udp")
+    def initialize(port : UInt16 = 0, @name : String = "udp", reuseport : Bool = false)
       @socket = UDPSocket.new
+      if reuseport
+        # nginx-style: several forked workers each bind the same port and
+        # the kernel spreads datagrams across them by flow hash
+        one = 1
+        LibC.setsockopt(@socket.fd, LibC::SOL_SOCKET, LibC::SO_REUSEPORT,
+          pointerof(one).as(Void*), sizeof(Int32))
+      end
       begin
         # enlarge kernel socket buffers (best effort, like wireguard-go's
         # bind does with its own generous buffer sizes)

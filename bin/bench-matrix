@@ -13,11 +13,15 @@ cd "$(dirname "$0")/.."
 SECONDS_BENCH=2
 PACKETS=20000
 SIZE=1400
+FLOWS=4
+WORKERS=4
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --seconds) SECONDS_BENCH="$2"; shift 2 ;;
     --packets) PACKETS="$2"; shift 2 ;;
     --size)    SIZE="$2"; shift 2 ;;
+    --flows)   FLOWS="$2"; shift 2 ;;
+    --workers) WORKERS="$2"; shift 2 ;;
     *) echo "unknown flag: $1" >&2; exit 2 ;;
   esac
 done
@@ -25,7 +29,7 @@ done
 BASE_PORT=55220
 mkdir -p bin
 (cd harness && go build -o "../bin/bench-go${BIN_EXT:-}" ./bench)
-crystal build --release -o bin/bench-cr tools/bench.cr
+crystal build --release -Dwithout_mt -o bin/bench-cr tools/bench.cr
 
 echo "== building done; running micro benchmarks (${SECONDS_BENCH}s per primitive)"
 echo
@@ -48,6 +52,54 @@ run_e2e() { # $1=server_bin  $2=client_bin  $3=port
   echo "$out"
 }
 
+# multi-flow: N concurrent client processes (distinct keys/subnets per flow)
+# against a server; the Crystal server runs fork workers with SO_REUSEPORT
+# (nginx process model, cf. serverx.cr), the Go server is one multi-
+# goroutine process on all cores
+run_multiflow() { # $1=server_bin  $2=client_bin  $3=port  $4=workers(0=plain server)
+  local server="$1" client="$2" port="$3" workers="$4"
+  local srv out_dir=/tmp/bench-matrix.$$
+  mkdir -p "$out_dir"
+  if [[ "$workers" == "0" ]]; then
+    ./"$server" server --port "$port" --peers "$FLOWS" >"$out_dir/srv.log" 2>&1 &
+  else
+    ./"$server" server --port "$port" --peers "$FLOWS" --workers "$workers" >"$out_dir/srv.log" 2>&1 &
+  fi
+  srv=$!
+  for _ in $(seq 1 100); do
+    [[ "$(grep -c server_ready "$out_dir/srv.log")" -ge 1 ]] && break
+    sleep 0.1
+  done
+  local pids=()
+  for id in $(seq 0 $((FLOWS - 1))); do
+    timeout 300 ./"$client" client --port "$port" --packets "$((PACKETS / FLOWS))" \
+      --size "$SIZE" --id "$id" >"$out_dir/cli$id.log" 2>&1 &
+    pids+=($!)
+  done
+  for p in "${pids[@]}"; do wait "$p"; done
+  kill -TERM "$srv" 2>/dev/null || true
+  sleep 0.3
+  pkill -P "$srv" 2>/dev/null || true   # forked workers of a killed master
+  local total_pps=0 total_mbps=0 count=0 rtt_sum=0
+  for id in $(seq 0 $((FLOWS - 1))); do
+    local pps mbps rtt
+    pps=$(grep -o "pps=[0-9.]*" "$out_dir/cli$id.log" | head -1 | cut -d= -f2)
+    mbps=$(grep -o "mbps=[0-9.]*" "$out_dir/cli$id.log" | head -1 | cut -d= -f2)
+    rtt=$(grep -o "handshake_rtt_us=[0-9.]*" "$out_dir/cli$id.log" | head -1 | cut -d= -f2)
+    [[ -z "$pps" ]] && continue
+    total_pps=$(echo "$total_pps + $pps" | bc)
+    total_mbps=$(echo "$total_mbps + $mbps" | bc)
+    rtt_sum=$(echo "$rtt_sum + $rtt" | bc)
+    count=$((count + 1))
+  done
+  rm -rf "$out_dir"
+  if [[ "$count" -eq 0 ]]; then
+    echo "client packets=0"
+    return
+  fi
+  echo "client multiflow=$count mbps=$total_mbps pps=$total_pps avg_rtt_us=$(echo "$rtt_sum / $count" | bc)"
+}
+
 echo "== go server + go client"
 GO_GO=$(run_e2e bin/bench-go bin/bench-go "$BASE_PORT")
 echo "$GO_GO"
@@ -63,6 +115,15 @@ echo
 echo "== cr server + go client"
 CR_GO=$(run_e2e bin/bench-cr bin/bench-go "$((BASE_PORT + 3))")
 echo "$CR_GO"
+echo
+
+echo "== multi-flow: go server (1 process, all cores) x $FLOWS go clients"
+GO_MF=$(run_multiflow bin/bench-go bin/bench-go "$((BASE_PORT + 4))" 0)
+echo "$GO_MF"
+echo
+echo "== multi-flow: cr server ($WORKERS fork workers, SO_REUSEPORT) x $FLOWS cr clients"
+CR_MF=$(run_multiflow bin/bench-cr bin/bench-cr "$((BASE_PORT + 5))" "$WORKERS")
+echo "$CR_MF"
 echo
 
 pick() { echo "$1" | grep -o "$2=[^ ]*" | head -1 | cut -d= -f2; }
@@ -84,4 +145,9 @@ pick() { echo "$1" | grep -o "$2=[^ ]*" | head -1 | cut -d= -f2; }
   printf '%-26s %12s %12s\n' "cross handshake rtt µs" "$(pick "$GO_CR" handshake_rtt_us)"  "$(pick "$CR_GO" handshake_rtt_us)"
   printf '%-26s %12s %12s\n' "cross echo MB/s"        "$(pick "$GO_CR" mbps)"               "$(pick "$CR_GO" mbps)"
   printf '%-26s %12s %12s\n' "cross echo pps"         "$(pick "$GO_CR" pps)"                "$(pick "$CR_GO" pps)"
+  echo
+  printf '%-26s %12s %12s\n' "" "go×$FLOWS" "cr×$FLOWS ($WORKERS workers)"
+  printf '%-26s %12s %12s\n' "multiflow echo MB/s"    "$(pick "$GO_MF" mbps)"               "$(pick "$CR_MF" mbps)"
+  printf '%-26s %12s %12s\n' "multiflow echo pps"     "$(pick "$GO_MF" pps)"                "$(pick "$CR_MF" pps)"
+  printf '%-26s %12s %12s\n' "multiflow avg rtt µs"   "$(pick "$GO_MF" avg_rtt_us)"         "$(pick "$CR_MF" avg_rtt_us)"
 } | tee bench-results.txt

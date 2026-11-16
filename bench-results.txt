@@ -1,16 +1,21 @@
                                      go      crystal
-x25519 ops/s                      16469        18178
-blake2s MB/s                     827.31       685.62
-kdf3 ops/s                       402249       483706
-chacha seal MB/s                1579.57       685.50
-chacha open MB/s                1713.15       685.87
+x25519 ops/s                      17239        19411
+blake2s MB/s                     841.40       734.44
+kdf3 ops/s                       418340       555417
+chacha seal MB/s                1608.50      1124.49
+chacha open MB/s                1774.33      1110.85
 
                                 go→go      cr→cr
-e2e handshake rtt µs              2053         1664
-e2e echo MB/s                    174.98       101.39
-e2e echo pps                     131061        75941
+e2e handshake rtt µs              2950         1573
+e2e echo MB/s                    199.69       177.27
+e2e echo pps                     149563       132773
 
                            go srv→cr cli cr srv→go cli
-cross handshake rtt µs            1555         3738
-cross echo MB/s                   98.78       124.69
-cross echo pps                    73988        93392
+cross handshake rtt µs            1197         3541
+cross echo MB/s                  167.51       199.41
+cross echo pps                   125466       149354
+
+                                  go×4 cr×4 (4 workers)
+multiflow echo MB/s              177.85       466.86
+multiflow echo pps               133208       349671
+multiflow avg rtt µs              4033         1295

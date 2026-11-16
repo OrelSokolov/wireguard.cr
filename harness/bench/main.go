@@ -37,6 +37,12 @@ func mustHex(s string) []byte {
 	return b
 }
 
+// distinct static key per client flow id (mirrors tools/bench.cr)
+func clientSkHex(id int) string {
+	base := sk1Hex[:len(sk1Hex)-2]
+	return base + fmt.Sprintf("%02x", id%256)
+}
+
 func clampPub(skHex string) (sk, pk []byte) {
 	sk = mustHex(skHex)
 	sk[0] &= 248
@@ -150,15 +156,15 @@ func buildDevice(skHex string, listenPort uint16) (*device.Device, *tuntest.Chan
 	return dev, tun
 }
 
-// ipv4 packet with src 10.0.0.1, dst 10.0.0.2
-func benchPacket(size int, seq int) []byte {
+// ipv4 packet for flow id: src 10.0.id.1, dst 10.0.id.2
+func benchPacket(size int, seq int, id int) []byte {
 	p := make([]byte, size)
 	p[0] = 0x45
 	binary.BigEndian.PutUint16(p[2:], uint16(size))
 	p[8] = 64
 	p[9] = 17
-	copy(p[12:], net4("10.0.0.1"))
-	copy(p[16:], net4("10.0.0.2"))
+	copy(p[12:], net4(fmt.Sprintf("10.0.%d.1", id)))
+	copy(p[16:], net4(fmt.Sprintf("10.0.%d.2", id)))
 	for i := 20; i < size; i++ {
 		p[i] = byte('a' + (i+seq)%26)
 	}
@@ -172,13 +178,16 @@ func net4(s string) []byte {
 
 // -------------------------------------------------------------------- server
 
-func runServer(port int) {
+func runServer(port int, peers int) {
 	dev, tun := buildDevice(sk2Hex, uint16(port))
 	defer dev.Close()
-	_, pk1 := clampPub(sk1Hex)
-	conf := "public_key=" + hex.EncodeToString(pk1) + "\nallowed_ip=10.0.0.0/24\n"
-	if err := dev.IpcSet(conf); err != nil {
-		panic(err)
+	for i := 0; i < peers; i++ {
+		_, pk := clampPub(clientSkHex(i))
+		conf := "public_key=" + hex.EncodeToString(pk) +
+			fmt.Sprintf("\nallowed_ip=10.0.%d.0/24\n", i)
+		if err := dev.IpcSet(conf); err != nil {
+			panic(err)
+		}
 	}
 
 	// echo everything the device delivers back into the tunnel
@@ -221,13 +230,12 @@ func splitLines(s string) []string {
 
 // -------------------------------------------------------------------- client
 
-func runClient(port, packets, size int) {
-	dev, tun := buildDevice(sk1Hex, 0)
+func runClient(port, packets, size, id int) {
+	dev, tun := buildDevice(clientSkHex(id), 0)
 	defer dev.Close()
 	_, pk2 := clampPub(sk2Hex)
 	conf := "public_key=" + hex.EncodeToString(pk2) +
-		fmt.Sprintf("\nendpoint=127.0.0.1:%d\n", port) +
-		"allowed_ip=10.0.0.0/24\n"
+		fmt.Sprintf("\nendpoint=127.0.0.1:%d\nallowed_ip=10.0.%d.0/24\n", port, id)
 	if err := dev.IpcSet(conf); err != nil {
 		panic(err)
 	}
@@ -242,7 +250,7 @@ func runClient(port, packets, size int) {
 	}()
 
 	// first packet: full handshake round trip
-	first := benchPacket(size, 0)
+	first := benchPacket(size, 0, id)
 	t0 := time.Now()
 	tun.Outbound <- first
 	<-received
@@ -259,7 +267,7 @@ func runClient(port, packets, size int) {
 			for sentCount.Load()-doneCount.Load() > 256 {
 				runtime.Gosched()
 			}
-			tun.Outbound <- benchPacket(size, i)
+			tun.Outbound <- benchPacket(size, i, id)
 			sentCount.Add(1)
 		}
 	}()
@@ -280,6 +288,8 @@ func main() {
 	port := flag.Int("port", 51820, "server listen / client target port")
 	packets := flag.Int("packets", 20000, "bulk packet count")
 	size := flag.Int("size", 1400, "packet payload size")
+	id := flag.Int("id", 0, "client flow id (distinct static key and subnet)")
+	peers := flag.Int("peers", 1, "number of pre-registered client flows")
 
 	// the subcommand comes first, then its flags (bench server --port N)
 	args := os.Args[1:]
@@ -292,9 +302,9 @@ func main() {
 	case "micro":
 		benchMicro(*seconds)
 	case "server":
-		runServer(*port)
+		runServer(*port, *peers)
 	case "client":
-		runClient(*port, *packets, *size)
+		runClient(*port, *packets, *size, *id)
 	default:
 		fmt.Fprintln(os.Stderr, "usage: bench [micro|server|client] [flags]")
 		os.Exit(2)
