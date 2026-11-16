@@ -100,49 +100,65 @@ packet = dev.tun.inbound.receive   # device → OS
 ## Performance vs wireguard-go
 
 `bin/bench-matrix` measures both implementations on the same machine:
-micro benchmarks of the protocol primitives, plus an end-to-end UDP
-client/server echo benchmark (fixed keys, 1400-byte packets, a 256-packet
-in-flight window, loopback). The cross combinations (Go server ↔ Crystal
-client and back) double as an interop check — the two implementations speak
-byte-identical WireGuard.
+micro benchmarks of the protocol primitives, an end-to-end UDP client/server
+echo benchmark (fixed keys, 1400-byte packets, a 256-packet in-flight
+window, loopback), and a multi-flow run (4 concurrent clients). The cross
+combinations (Go server ↔ Crystal client and back) double as an interop
+check — the two implementations speak byte-identical WireGuard. In the
+multi-flow run the Crystal server uses nginx-style fork workers with
+`SO_REUSEPORT` (one process per core); the Go server is a single
+multi-goroutine process on all cores.
 
 ```sh
 bin/bench-matrix --seconds 2 --packets 20000   # writes bench-results.txt
 ```
 
-Sample run (this machine, single-threaded Crystal event loop vs Go's
-multi-goroutine pipeline):
+Sample run (this machine; single-flow rows are one Crystal event loop
+vs one multi-goroutine Go process):
 
 ```
                                      go      crystal
-x25519 ops/s                      14726        16633
-blake2s MB/s                     783.48       371.79
-kdf3 ops/s                       352463       139779
-chacha seal MB/s                 736.95       357.41
-chacha open MB/s                 973.09       610.50
+x25519 ops/s                      16097        18016
+blake2s MB/s                     829.29       693.73
+kdf3 ops/s                      406181       518253
+chacha seal MB/s                1580.49      1177.46
+chacha open MB/s                1708.60      1183.72
 
                                 go→go      cr→cr
-e2e handshake rtt µs              1918         3083
-e2e echo MB/s                    178.53        65.31
-e2e echo pps                     133717       48917
+e2e handshake rtt µs              3977         1308
+e2e echo MB/s                    191.49       172.89
+e2e echo pps                     143424       129491
 
                            go srv→cr cli cr srv→go cli
-cross handshake rtt µs            1887         4742
-cross echo MB/s                   77.15        68.60
-cross echo pps                    57784        51377
+cross handshake rtt µs            1935         3919
+cross echo MB/s                  165.93       188.64
+cross echo pps                   124276       141286
+
+                                  go×4 cr×4 (4 workers)
+multiflow echo MB/s              170.06       422.13
+multiflow echo pps               127377       316167
+multiflow avg rtt µs              3374         1419
 ```
 
 Reading it:
 
 - **x25519** is slightly faster on Crystal — both call the same libcrypto,
   but Go's oracle uses its own pure-Go curve25519.
-- **blake2s / kdf / AEAD** are ~2–2.5× slower: the port hashes with pure
-  Crystal and allocates per EVP call; wireguard-go uses optimized pure-Go.
-- **End-to-end** Crystal reaches roughly a third of Go's throughput
-  (~49k vs ~134k pps). The gap tracks the crypto gap plus the port's
-  single-fiber receive pipeline versus Go's multi-goroutine queues.
-- **Cross combos** are capped by the Crystal side (~51–58k pps), confirming
-  the bottleneck is symmetric and that interop works over real UDP.
+- **blake2s / kdf / AEAD**: after the SSA-style pure-Crystal BLAKE2s and the
+  pooled EVP AEAD (fetched provider cipher, ctx re-init without
+  re-selection) the remaining gap is small — kdf3 is faster than Go,
+  blake2s and AEAD sit within ~1.2–1.45× of wireguard-go's optimized
+  pure-Go.
+- **End-to-end single-flow** Crystal reaches ~90% of Go's throughput
+  (~129k vs ~143k pps) on one fiber per direction, while Go parallelizes
+  its pipeline across goroutines.
+- **Cross combos** run at full speed in both directions (Go server ↔
+  Crystal client and back), confirming interop over real UDP with no
+  bottleneck on either side.
+- **Multi-flow** is where the fork-worker model pays off: 4 Crystal
+  workers sustain ~316k pps vs Go's ~127k (~2.5×), with lower average
+  handshake RTT — each worker owns a whole event loop instead of sharing
+  one scheduler across goroutines.
 
 
 ## Roadmap (not yet ported)

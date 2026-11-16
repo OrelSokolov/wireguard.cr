@@ -34,17 +34,28 @@ module Wireguard
     # scheduler, no yields inside, so a single shared ctx is safe).
     # The cipher is fetched once through the OpenSSL 3 provider path — the
     # static EVP_chacha20_poly1305 handle routes through the legacy path,
-    # which is noticeably slower.
+    # which is noticeably slower. The cipher is also installed on each ctx
+    # exactly once; per call we re-init with cipher=NULL (key+nonce only),
+    # which skips the provider re-selection and is measurably faster than
+    # a full EVP_EncryptInit_ex with the cipher handle on every call.
     @@cipher : Void* = Evp.EVP_CIPHER_fetch(nil, "chacha20-poly1305", nil)
-    @@enc_ctx : Void* = Evp.EVP_CIPHER_CTX_new
-    @@dec_ctx : Void* = Evp.EVP_CIPHER_CTX_new
+    @@enc_ctx : Void* = begin
+      ctx = Evp.EVP_CIPHER_CTX_new
+      Evp.EVP_EncryptInit_ex(ctx, @@cipher, nil, nil, nil)
+      ctx
+    end
+    @@dec_ctx : Void* = begin
+      ctx = Evp.EVP_CIPHER_CTX_new
+      Evp.EVP_DecryptInit_ex(ctx, @@cipher, nil, nil, nil)
+      ctx
+    end
 
     # Encrypts into dst at offset: ciphertext followed by the 16-byte tag.
     # Returns the number of bytes written (plaintext.size + TAG_SIZE).
     def self.seal_into(dst : Bytes, offset : Int32, key : Bytes, nonce : Bytes,
                        plaintext : Bytes, aad : Bytes?) : Int32
       raise OpenError.new("ctx_new failed") if @@enc_ctx.null?
-      rc = Evp.EVP_EncryptInit_ex(@@enc_ctx, @@cipher, nil, key, nonce)
+      rc = Evp.EVP_EncryptInit_ex(@@enc_ctx, nil, nil, key, nonce)
       raise OpenError.new("encrypt_init failed") if rc != 1
       outl = 0
       if aad && !aad.empty?
@@ -77,7 +88,7 @@ module Wireguard
                        ct_and_tag : Bytes, aad : Bytes?) : Int32?
       return nil unless ct_and_tag.size >= TAG_SIZE
       return nil if @@dec_ctx.null?
-      rc = Evp.EVP_DecryptInit_ex(@@dec_ctx, @@cipher, nil, key, nonce)
+      rc = Evp.EVP_DecryptInit_ex(@@dec_ctx, nil, nil, key, nonce)
       return nil if rc != 1
       outl = 0
       if aad && !aad.empty?
