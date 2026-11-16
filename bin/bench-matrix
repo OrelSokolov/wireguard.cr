@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# Benchmark matrix: wireguard-go (oracle) vs wireguard.cr over real UDP.
+#
+# Runs micro benchmarks for both implementations, then four client/server
+# combinations (go→go, cr→cr, go-server→cr-client, cr-server→go-client) and
+# prints a summary table. The cross combinations double as an interop check:
+# the two implementations speak byte-identical WireGuard.
+#
+# Usage: bin/bench-matrix [--seconds N] [--packets N] [--size N]
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+SECONDS_BENCH=2
+PACKETS=20000
+SIZE=1400
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --seconds) SECONDS_BENCH="$2"; shift 2 ;;
+    --packets) PACKETS="$2"; shift 2 ;;
+    --size)    SIZE="$2"; shift 2 ;;
+    *) echo "unknown flag: $1" >&2; exit 2 ;;
+  esac
+done
+
+BASE_PORT=55220
+mkdir -p bin
+(cd harness && go build -o "../bin/bench-go${BIN_EXT:-}" ./bench)
+crystal build --release -o bin/bench-cr tools/bench.cr
+
+echo "== building done; running micro benchmarks (${SECONDS_BENCH}s per primitive)"
+echo
+GO_MICRO=$(./bin/bench-go micro --seconds "$SECONDS_BENCH")
+CR_MICRO=$(./bin/bench-cr micro --seconds "$SECONDS_BENCH")
+
+run_e2e() { # $1=server_bin  $2=client_bin  $3=port
+  local server="$1" client="$2" port="$3" srv log out
+  log=$(mktemp)
+  ./"$server" server --port "$port" >"$log" 2>&1 &
+  srv=$!
+  for _ in $(seq 1 100); do
+    grep -q server_ready "$log" && break
+    sleep 0.1
+  done
+  out=$(timeout 300 ./"$client" client --port "$port" --packets "$PACKETS" --size "$SIZE")
+  kill -TERM "$srv" 2>/dev/null || true
+  wait "$srv" 2>/dev/null || true
+  rm -f "$log"
+  echo "$out"
+}
+
+echo "== go server + go client"
+GO_GO=$(run_e2e bin/bench-go bin/bench-go "$BASE_PORT")
+echo "$GO_GO"
+echo
+echo "== cr server + cr client"
+CR_CR=$(run_e2e bin/bench-cr bin/bench-cr "$((BASE_PORT + 1))")
+echo "$CR_CR"
+echo
+echo "== go server + cr client"
+GO_CR=$(run_e2e bin/bench-go bin/bench-cr "$((BASE_PORT + 2))")
+echo "$GO_CR"
+echo
+echo "== cr server + go client"
+CR_GO=$(run_e2e bin/bench-cr bin/bench-go "$((BASE_PORT + 3))")
+echo "$CR_GO"
+echo
+
+pick() { echo "$1" | grep -o "$2=[^ ]*" | head -1 | cut -d= -f2; }
+
+{
+  printf '%-26s %12s %12s\n' "" "go" "crystal"
+  printf '%-26s %12s %12s\n' "x25519 ops/s"        "$(pick "$GO_MICRO" x25519_ops)"        "$(pick "$CR_MICRO" x25519_ops)"
+  printf '%-26s %12s %12s\n' "blake2s MB/s"        "$(pick "$GO_MICRO" blake2s_mbs)"       "$(pick "$CR_MICRO" blake2s_mbs)"
+  printf '%-26s %12s %12s\n' "kdf3 ops/s"          "$(pick "$GO_MICRO" kdf3_ops)"          "$(pick "$CR_MICRO" kdf3_ops)"
+  printf '%-26s %12s %12s\n' "chacha seal MB/s"    "$(pick "$GO_MICRO" seal_mbs)"          "$(pick "$CR_MICRO" seal_mbs)"
+  printf '%-26s %12s %12s\n' "chacha open MB/s"    "$(pick "$GO_MICRO" open_mbs)"          "$(pick "$CR_MICRO" open_mbs)"
+  echo
+  printf '%-26s %12s %12s\n' "" "go→go" "cr→cr"
+  printf '%-26s %12s %12s\n' "e2e handshake rtt µs" "$(pick "$GO_GO" handshake_rtt_us)"     "$(pick "$CR_CR" handshake_rtt_us)"
+  printf '%-26s %12s %12s\n' "e2e echo MB/s"        "$(pick "$GO_GO" mbps)"                 "$(pick "$CR_CR" mbps)"
+  printf '%-26s %12s %12s\n' "e2e echo pps"         "$(pick "$GO_GO" pps)"                  "$(pick "$CR_CR" pps)"
+  echo
+  printf '%-26s %12s %12s\n' "" "go srv→cr cli" "cr srv→go cli"
+  printf '%-26s %12s %12s\n' "cross handshake rtt µs" "$(pick "$GO_CR" handshake_rtt_us)"  "$(pick "$CR_GO" handshake_rtt_us)"
+  printf '%-26s %12s %12s\n' "cross echo MB/s"        "$(pick "$GO_CR" mbps)"               "$(pick "$CR_GO" mbps)"
+  printf '%-26s %12s %12s\n' "cross echo pps"         "$(pick "$GO_CR" pps)"                "$(pick "$CR_GO" pps)"
+} | tee bench-results.txt

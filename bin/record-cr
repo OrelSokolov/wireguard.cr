@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Regenerate the Crystal port snapshot tree.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+crystal build -o bin/snapshot tools/snapshot.cr
+./bin/snapshot artifacts/cr

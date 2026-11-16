@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Regenerate the oracle (wireguard-go) snapshot tree.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+(cd harness && go run . ../artifacts/go)

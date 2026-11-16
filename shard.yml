@@ -1,0 +1,14 @@
+name: wireguard
+version: 0.1.0
+authors:
+  - wireguard.cr contributors
+description: |
+  WireGuard protocol implementation in Crystal, verified against wireguard-go
+  (the Go oracle) with twinshot snapshot testing.
+license: MIT
+
+targets:
+  snapshot:
+    main: tools/snapshot.cr
+
+crystal: ">= 1.11.0"

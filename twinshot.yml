@@ -1,0 +1,10 @@
+# Differential testing: wireguard-go (oracle) vs the Crystal port (current).
+# Each side is recorded from the same deterministic scenarios; twinshot then
+# requires 1:1 parity across all snapshot files.
+oracle:
+  path: artifacts/go
+  generate: bin/record-go
+
+current:
+  path: artifacts/cr
+  generate: bin/record-cr

@@ -1,0 +1,16 @@
+                                     go      crystal
+x25519 ops/s                      14726        16633
+blake2s MB/s                     783.48       371.79
+kdf3 ops/s                       352463       139779
+chacha seal MB/s                 736.95       357.41
+chacha open MB/s                 973.09       610.50
+
+                                go→go      cr→cr
+e2e handshake rtt µs              1918         3083
+e2e echo MB/s                    178.53        65.31
+e2e echo pps                     133717        48917
+
+                           go srv→cr cli cr srv→go cli
+cross handshake rtt µs            1887         4742
+cross echo MB/s                   77.15        68.60
+cross echo pps                    57784        51377
