@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# wg-cr: wg-compatible CLI against a wireguard.cr UAPI socket.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+exec crystal run --release tools/wg_cli.cr -- "$@"

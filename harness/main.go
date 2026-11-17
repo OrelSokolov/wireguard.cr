@@ -58,6 +58,7 @@ func mustHex(s string) []byte {
 // ---------------------------------------------------------------- 01 x25519
 
 const sk1Hex = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
+const sk3Hex = "2122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40"
 const sk2Hex = "5152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f70"
 
 func snapX25519() {
@@ -592,6 +593,96 @@ func (b *memBind) ParseEndpoint(s string) (conn.Endpoint, error) {
 
 func (b *memBind) BatchSize() int { return 1 }
 
+func snapUapi() {
+	w := writeSnap("11_uapi.txt")
+	defer doneSnap(w, "11_uapi.txt")
+
+	router := newMemRouter("A", "B")
+	bindA := &memBind{name: "A", router: router}
+	bindB := &memBind{name: "B", router: router}
+	logger := device.NewLogger(device.LogLevelError, "")
+	tunA := tuntest.NewChannelTUN()
+	tunB := tuntest.NewChannelTUN()
+	devA := device.NewDevice(tunA.TUN(), bindA, logger)
+	devB := device.NewDevice(tunB.TUN(), bindB, logger)
+	defer devA.Close()
+	defer devB.Close()
+
+	confA := "private_key=" + sk1Hex + "\nreplace_peers=true\npublic_key=" +
+		dev2PK() + "\nendpoint=B\nallowed_ip=10.0.0.0/24\npreshared_key=" + pskHex + "\n"
+	confB := "private_key=" + sk2Hex + "\nreplace_peers=true\npublic_key=" +
+		dev1PK() + "\nendpoint=A\nallowed_ip=10.0.0.0/24\npreshared_key=" + pskHex + "\n"
+	fmt.Fprintf(w, "ipc_setup=%v %v\n", devA.IpcSet(confA) == nil, devB.IpcSet(confB) == nil)
+
+	if err := devA.Up(); err != nil {
+		panic(err)
+	}
+	if err := devB.Up(); err != nil {
+		panic(err)
+	}
+
+	inject := func(t *tuntest.ChannelTUN, p []byte) {
+		cp := append([]byte(nil), p...)
+		t.Outbound <- cp
+	}
+	readOne := func(ch chan []byte, timeout time.Duration) ([]byte, bool) {
+		select {
+		case p := <-ch:
+			return p, true
+		case <-time.After(timeout):
+			return nil, false
+		}
+	}
+	drain := func(ch chan []byte) {
+		for {
+			select {
+			case <-ch:
+				continue
+			default:
+				return
+			}
+		}
+	}
+	delivered := func(ch chan []byte, timeout time.Duration) bool {
+		p, ok := readOne(ch, timeout)
+		return ok && len(p) > 0
+	}
+
+	// initial session + data
+	inject(tunA, ipv4Packet(10, 32, 1))
+	fmt.Fprintf(w, "setup_delivered=%v\n", delivered(tunB.Inbound, 15*time.Second))
+
+	// remove peer B on A: routing must go away with it
+	err := devA.IpcSet("public_key=" + dev2PK() + "\nremove=true\n")
+	fmt.Fprintf(w, "remove_ok=%v\n", err == nil)
+	fmt.Fprintf(w, "removed_peer_gone=%v\n", devA.LookupPeer(mustPK(dev2PK())) == nil)
+	drain(tunB.Inbound)
+	inject(tunA, ipv4Packet(10, 32, 2))
+	fmt.Fprintf(w, "after_remove_delivered=%v\n", delivered(tunB.Inbound, 200*time.Millisecond))
+
+	// update_only must not create a brand new peer
+	err = devA.IpcSet("public_key=" + pkHexFromSk(sk3Hex) +
+		"\nupdate_only=true\nendpoint=B\nallowed_ip=10.9.0.0/24\n")
+	fmt.Fprintf(w, "update_only_ok=%v\n", err == nil)
+	fmt.Fprintf(w, "update_only_peer_gone=%v\n", devA.LookupPeer(mustPK(pkHexFromSk(sk3Hex))) == nil)
+
+	// re-add the peer: data must flow again
+	err = devA.IpcSet("public_key=" + dev2PK() +
+		"\nendpoint=B\nallowed_ip=10.0.0.0/24\npreshared_key=" + pskHex + "\n")
+	fmt.Fprintf(w, "readd_ok=%v\n", err == nil)
+	inject(tunA, ipv4Packet(10, 32, 3))
+	fmt.Fprintf(w, "readd_delivered=%v\n", delivered(tunB.Inbound, 15*time.Second))
+
+	// rotate A's private key; B must re-learn A's new public key
+	err = devA.IpcSet("private_key=" + sk3Hex + "\n")
+	fmt.Fprintf(w, "rotate_ok=%v\n", err == nil)
+	err = devB.IpcSet("replace_peers=true\npublic_key=" + pkHexFromSk(sk3Hex) +
+		"\nendpoint=A\nallowed_ip=10.0.0.0/24\npreshared_key=" + pskHex + "\n")
+	fmt.Fprintf(w, "rotate_peer_ok=%v\n", err == nil)
+	inject(tunA, ipv4Packet(10, 48, 4))
+	fmt.Fprintf(w, "rotation_delivered=%v\n", delivered(tunB.Inbound, 15*time.Second))
+}
+
 func snapTransport() {
 	w := writeSnap("10_transport.txt")
 	defer doneSnap(w, "10_transport.txt")
@@ -775,4 +866,5 @@ func main() {
 	snapAllowedIPs()
 	snapRatelimiter()
 	snapTransport()
+	snapUapi()
 }

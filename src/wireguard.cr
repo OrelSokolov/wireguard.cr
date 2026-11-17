@@ -16,7 +16,9 @@ require "./wireguard/ratelimiter"
 require "./wireguard/keypair"
 require "./wireguard/device"
 require "./wireguard/udp_bind"
+require "./wireguard/tun_device"
 require "./wireguard/uapi"
+require "./wireguard/uapi_server"
 
 module Wireguard
   VERSION = "0.1.0"

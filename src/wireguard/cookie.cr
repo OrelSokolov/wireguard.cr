@@ -6,6 +6,16 @@ require "./chacha20poly1305"
 require "./noise_helpers"
 
 module Wireguard
+  # Constant-time equality (the moral equivalent of Go's hmac.Equal).
+  def self.secure_equal(a : Bytes, b : Bytes) : Bool
+    return false unless a.size == b.size
+    acc = 0_u8
+    a.each_with_index do |x, i|
+      acc |= x ^ b.unsafe_fetch(i)
+    end
+    acc == 0
+  end
+
   class CookieChecker
     @mac1_key : Bytes = Bytes.new(Blake2s::SIZE)
     @mac2_secret : Bytes = Bytes.new(Blake2s::SIZE)
@@ -25,7 +35,7 @@ module Wireguard
       smac2 = msg.size - Blake2s::SIZE128
       smac1 = smac2 - Blake2s::SIZE128
       mac1 = Blake2s.digest128(msg[0, smac1], @mac1_key)
-      mac1 == msg[smac1, 16]
+      Wireguard.secure_equal(mac1, msg[smac1, 16])
     end
 
     def check_mac2(msg : Bytes, src : Bytes) : Bool
@@ -34,7 +44,7 @@ module Wireguard
       cookie = Blake2s.digest128(src, @mac2_secret)
       smac2 = msg.size - Blake2s::SIZE128
       mac2 = Blake2s.digest128(msg[0, smac2], cookie)
-      mac2 == msg[smac2, 16]
+      Wireguard.secure_equal(mac2, msg[smac2, 16])
     end
 
     # Creates a cookie reply for a handshake message. The random secret and

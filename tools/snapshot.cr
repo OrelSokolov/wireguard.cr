@@ -8,6 +8,7 @@ OUT_DIR = ARGV[0]? || "artifacts/cr"
 
 SK1_HEX = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
 SK2_HEX = "5152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f70"
+SK3_HEX = "2122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40"
 PSK_HEX = "443d1c4a5d6f8e9a7b2c1d0e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a"
 
 def write_snap(name : String, & : IO -> _) : Nil
@@ -387,6 +388,123 @@ def snap_ratelimiter : Nil
   end
 end
 
+# ------------------------------------------------------------------- 11 uapi
+
+def snap_uapi : Nil
+  write_snap("11_uapi.txt") do |w|
+    router = Wireguard::MemBind::Router.new
+    bind_a = Wireguard::MemBind.new(router, "A")
+    bind_b = Wireguard::MemBind.new(router, "B")
+    dev_a = Wireguard::Device.new("A")
+    dev_b = Wireguard::Device.new("B")
+    dev_a.attach_bind(bind_a)
+    dev_b.attach_bind(bind_b)
+    pk1 = pk_of(SK1_HEX)
+    pk2 = pk_of(SK2_HEX)
+    pk3 = pk_of(SK3_HEX)
+
+    conf_a = "private_key=#{SK1_HEX}\nreplace_peers=true\npublic_key=#{pk2.hexstring}" \
+             "\nendpoint=B\nallowed_ip=10.0.0.0/24\npreshared_key=#{PSK_HEX}\n"
+    conf_b = "private_key=#{SK2_HEX}\nreplace_peers=true\npublic_key=#{pk1.hexstring}" \
+             "\nendpoint=A\nallowed_ip=10.0.0.0/24\npreshared_key=#{PSK_HEX}\n"
+    ok_a = ok_b = true
+    begin
+      dev_a.ipc_set(conf_a)
+    rescue
+      ok_a = false
+    end
+    begin
+      dev_b.ipc_set(conf_b)
+    rescue
+      ok_b = false
+    end
+    w << "ipc_setup=" << ok_a << " " << ok_b << "\n"
+
+    dev_a.start
+    dev_b.start
+
+    inject = ->(dev : Wireguard::Device, packet : Bytes) do
+      dev.tun.outbound.send(packet)
+    end
+    delivered = ->(ch : Channel(Bytes), timeout : Time::Span) do
+      select
+      when p = ch.receive
+        !p.empty?
+      when timeout timeout
+        false
+      end
+    end
+    drain = ->(ch : Channel(Bytes)) do
+      loop do
+        select
+        when ch.receive
+        else
+          break
+        end
+      end
+    end
+
+    # initial session + data
+    inject.call(dev_a, ipv4_packet(32, 1))
+    w << "setup_delivered=" << delivered.call(dev_b.tun.inbound, 15.seconds) << "\n"
+
+    # remove peer B on A: routing must go away with it
+    ok = true
+    begin
+      dev_a.ipc_set("public_key=#{pk2.hexstring}\nremove=true\n")
+    rescue
+      ok = false
+    end
+    w << "remove_ok=" << ok << "\n"
+    w << "removed_peer_gone=" << dev_a.lookup_peer(pk2).nil? << "\n"
+    drain.call(dev_b.tun.inbound)
+    inject.call(dev_a, ipv4_packet(32, 2))
+    w << "after_remove_delivered=" << delivered.call(dev_b.tun.inbound, 200.milliseconds) << "\n"
+
+    # update_only must not create a brand new peer
+    ok = true
+    begin
+      dev_a.ipc_set("public_key=#{pk3.hexstring}\nupdate_only=true\nendpoint=B\nallowed_ip=10.9.0.0/24\n")
+    rescue
+      ok = false
+    end
+    w << "update_only_ok=" << ok << "\n"
+    w << "update_only_peer_gone=" << dev_a.lookup_peer(pk3).nil? << "\n"
+
+    # re-add the peer: data must flow again
+    ok = true
+    begin
+      dev_a.ipc_set("public_key=#{pk2.hexstring}\nendpoint=B\nallowed_ip=10.0.0.0/24\npreshared_key=#{PSK_HEX}\n")
+    rescue
+      ok = false
+    end
+    w << "readd_ok=" << ok << "\n"
+    inject.call(dev_a, ipv4_packet(32, 3))
+    w << "readd_delivered=" << delivered.call(dev_b.tun.inbound, 15.seconds) << "\n"
+
+    # rotate A's private key; B must re-learn A's new public key
+    ok = true
+    begin
+      dev_a.ipc_set("private_key=#{SK3_HEX}\n")
+    rescue
+      ok = false
+    end
+    w << "rotate_ok=" << ok << "\n"
+    ok = true
+    begin
+      dev_b.ipc_set("replace_peers=true\npublic_key=#{pk3.hexstring}\nendpoint=A\nallowed_ip=10.0.0.0/24\npreshared_key=#{PSK_HEX}\n")
+    rescue
+      ok = false
+    end
+    w << "rotate_peer_ok=" << ok << "\n"
+    inject.call(dev_a, ipv4_packet(48, 4))
+    w << "rotation_delivered=" << delivered.call(dev_b.tun.inbound, 15.seconds) << "\n"
+
+    dev_a.stop
+    dev_b.stop
+  end
+end
+
 # --------------------------------------------------------------- 10 transport
 
 def snap_transport : Nil
@@ -498,3 +616,4 @@ snap_replay
 snap_allowedips
 snap_ratelimiter
 snap_transport
+snap_uapi

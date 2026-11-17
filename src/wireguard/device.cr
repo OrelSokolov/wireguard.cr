@@ -11,6 +11,8 @@ require "./cookie"
 require "./replay"
 require "./allowed_ips"
 require "./keypair"
+require "./ratelimiter"
+require "./timers"
 require "random"
 
 module Wireguard
@@ -25,11 +27,20 @@ module Wireguard
 
     abstract def send(dst : String, data : Bytes) : Nil
 
-    def inbox : Channel(MemBind::Packet)
-      raise "this bind receives via next_packet?"
+    # True when the transport is under sustained pressure and handshake
+    # messages should be cookie-filtered (see Device#under_load?).
+    def under_load? : Bool
+      false
     end
 
     def start : Nil
+    end
+
+    def close : Nil
+    end
+
+    def inbox : Channel(MemBind::Packet)
+      raise "this bind receives via next_packet?"
     end
   end
 
@@ -51,16 +62,25 @@ module Wireguard
 
     def initialize(router : Router, @name : String)
       @inbox = Channel(Packet).new(256)
+      @closed = false
       @router = router
       router.register(self)
     end
 
     def next_packet? : Packet?
       inbox.receive?
+    rescue Channel::ClosedError
+      nil
     end
 
     def send(dst : String, data : Bytes) : Nil
       @router.not_nil!.as(Router).send(@name, dst, data)
+    end
+
+    def close : Nil
+      return if @closed
+      @closed = true
+      inbox.close
     end
 
     class Router
@@ -107,16 +127,34 @@ module Wireguard
     getter peers : Hash(Bytes, Peer) = {} of Bytes => Peer
     getter allowedips = AllowedIPs.new
     getter cookie_checker = CookieChecker.new
+    getter rate_limiter = RateLimiter.new
     getter tun = TunChannels.new
     getter bind : Bind?
     property up : Bool = false
     property name : String = ""
+    # configured listen port / fwmark (reported by ipc_get; re-binding the
+    # attached bind on change is not implemented)
+    property listen_port : UInt16 = 0
+    property fwmark : UInt32 = 0
+    # manual under-load switch for the cookie mechanism (in addition to any
+    # pressure signal reported by the bind itself)
+    property manual_under_load : Bool = false
 
     @index_table : Hash(UInt32, IndexEntry) = {} of UInt32 => IndexEntry
     @next_index : UInt32 = 1
 
     def initialize(@name : String)
       @tun_channels = @tun
+    end
+
+    # Use a different tun channel pair (e.g. the fibers of a TunDevice).
+    def attach_tun(channels : TunChannels) : Nil
+      @tun = channels
+      @tun_channels = channels
+    end
+
+    def under_load? : Bool
+      manual_under_load || !!@bind.try(&.under_load?)
     end
 
     def set_private_key(sk : Bytes) : Nil
@@ -126,6 +164,17 @@ module Wireguard
       @cookie_checker.init(@pk)
       # drop peers whose public key matches ours, like wireguard-go
       @peers.reject! { |k, _| k == @pk }
+      # recompute static-static secrets and expire sessions (like
+      # wireguard-go's Device.SetPrivateKey)
+      @peers.each_value do |peer|
+        begin
+          ss = X25519.shared_secret(@sk, peer.remote_static)
+          ss.copy_to(peer.precomputed_static_static)
+        rescue X25519::Error
+          peer.precomputed_static_static.fill(0)
+        end
+        peer.expire_current_keypairs
+      end
     end
 
     def new_peer(pk : Bytes) : Peer
@@ -145,6 +194,16 @@ module Wireguard
       @peers[pk]?
     end
 
+    # Full peer teardown (wireguard-go's removePeerLocked): routing, timers,
+    # key material and index entries.
+    def remove_peer(pk : Bytes) : Nil
+      peer = @peers[pk]?
+      return unless peer
+      @allowedips.remove_by_peer(peer)
+      peer.stop_and_cleanup
+      @peers.delete(pk)
+    end
+
     def attach_bind(bind : Bind) : Nil
       @bind = bind
     end
@@ -153,7 +212,7 @@ module Wireguard
     def start : Nil
       return if @up
       @up = true
-      @peers.each_value(&.running=(true))
+      @peers.each_value(&.start)
       if bind = @bind
         bind.start
         spawn receive_loop(bind)
@@ -163,6 +222,8 @@ module Wireguard
 
     def stop : Nil
       @up = false
+      @peers.each_value(&.stop)
+      @bind.try(&.close)
     end
 
     # ------------------------------------------------------------- indexes
@@ -176,6 +237,14 @@ module Wireguard
     end
 
     def new_index(peer : Peer, keypair : Keypair?) : UInt32
+      # random indexes, like wireguard-go's indexTable (unguessable receiver
+      # indices); fall back to the sequential counter after rare collisions
+      8.times do
+        idx = Random::Secure.rand(UInt32)
+        next if idx == 0 || @index_table[idx]?
+        @index_table[idx] = IndexEntry.new(peer, keypair)
+        return idx
+      end
       idx = @next_index
       @next_index += 1
       @next_index = 1 if @next_index == 0
@@ -360,15 +429,7 @@ module Wireguard
       kp = Keypair.new(send_key, recv_key, is_initiator, peer.local_index, peer.remote_index, peer)
       swap_index_for_keypair(peer.local_index, kp)
       peer.local_index = 0
-
-      if is_initiator
-        peer.previous_keypair = peer.next_keypair || peer.current_keypair
-        peer.current_keypair = kp
-        peer.next_keypair = nil
-      else
-        peer.next_keypair = kp
-        peer.previous_keypair = nil
-      end
+      peer.insert_keypair(kp)
       true
     end
 
@@ -422,12 +483,38 @@ module Wireguard
       case msg_type
       when Messages::MESSAGE_INITIATION_TYPE, Messages::MESSAGE_RESPONSE_TYPE
         return unless @cookie_checker.check_mac1(data)
+        if under_load?
+          # under load: demand MAC2, else answer with a cookie reply and let
+          # the rate limiter cap accepted handshakes (receive.go)
+          unless @cookie_checker.check_mac2(data, source_ip(src).to_slice)
+            send_cookie_reply(src, data)
+            return
+          end
+          return unless @rate_limiter.allow(source_ip(src))
+        end
         handle_handshake_datagram(src, data, msg_type)
       when Messages::MESSAGE_COOKIE_REPLY_TYPE
         handle_cookie_reply(data)
       when Messages::MESSAGE_TRANSPORT_TYPE
         handle_transport(src, data)
       end
+    end
+
+    # Source "ip:port" -> "ip" (mem-bind names pass through whole).
+    private def source_ip(src : String) : String
+      head, _, tail = src.rpartition(':')
+      tail.empty? || head.empty? ? src : head
+    end
+
+    private def send_cookie_reply(src : String, data : Bytes) : Nil
+      recv = IO::ByteFormat::LittleEndian.decode(UInt32, data[4, 4])
+      secret = Bytes.new(32)
+      nonce = Bytes.new(24)
+      Random::Secure.random_bytes(secret)
+      Random::Secure.random_bytes(nonce)
+      reply = @cookie_checker.create_reply(
+        data, recv, source_ip(src).to_slice, secret, nonce)
+      @bind.try(&.send(src, reply.marshal))
     end
 
     private def handle_handshake_datagram(src : String, data : Bytes, msg_type : UInt32) : Nil
@@ -441,14 +528,19 @@ module Wireguard
         end
         peer = consume_message_initiation(msg)
         return unless peer
+        peer.timers_any_authenticated_packet_traversal
+        peer.timers_any_authenticated_packet_received
         peer.rx_bytes &+= data.size
-        peer.endpoint = src
+        peer.endpoint_src = src
+        # respond: build, derive session keys, then send (the order of
+        # wireguard-go's SendHandshakeResponse)
         resp = create_message_response(peer)
         return unless resp
+        return unless begin_symmetric_session(peer)
+        peer.timers_session_derived
+        peer.timers_any_authenticated_packet_traversal
+        peer.timers_any_authenticated_packet_sent
         send_handshake_message(peer, resp.marshal)
-        # the responder derives session keys right after sending the response
-        # (wireguard-go SendHandshakeResponse -> BeginSymmetricSession)
-        begin_symmetric_session(peer)
       when Messages::MESSAGE_RESPONSE_TYPE
         msg = Messages::MessageResponse.new
         begin
@@ -458,13 +550,16 @@ module Wireguard
         end
         peer = consume_message_response(msg)
         return unless peer
+        peer.endpoint_src = src
         peer.rx_bytes &+= data.size
-        peer.endpoint = src
+        peer.timers_any_authenticated_packet_traversal
+        peer.timers_any_authenticated_packet_received
         return unless begin_symmetric_session(peer)
-        # initiator: confirm session and flush staged packets; a keepalive is
-        # only staged when nothing else is queued (like wireguard-go)
-        peer.send_keepalive_if_idle
-        peer.flush_staged
+        peer.timers_session_derived
+        peer.timers_handshake_complete
+        # keepalive only when nothing else is queued, then flush staged
+        # (wireguard-go: timersHandshakeComplete + SendKeepalive)
+        peer.send_keepalive
       end
     end
 
@@ -490,6 +585,13 @@ module Wireguard
       kp = entry.keypair
       return unless kp
 
+      # expired session: drop it from the table, like lookupKeypair
+      if kp.expired?
+        delete_index(receiver)
+        kp.zero!
+        return
+      end
+
       nonce = @@nonce_scratch
       IO::ByteFormat::LittleEndian.encode(counter, nonce[4, 8])
       pt = @@pt_scratch
@@ -504,10 +606,18 @@ module Wireguard
       return unless kp.replay_filter.validate_counter(counter, Keypair::REJECT_AFTER_MESSAGES)
       peer.rx_bytes &+= content_len + 32
 
-      peer.received_with_keypair(kp)
-      peer.endpoint = src
+      if peer.received_with_keypair(kp)
+        peer.endpoint_src = src
+        peer.timers_handshake_complete
+        peer.flush_staged
+      end
+      peer.endpoint_src = src
+      peer.keep_key_fresh_receiving
+      peer.timers_any_authenticated_packet_traversal
+      peer.timers_any_authenticated_packet_received
 
       return if content_len == 0 # keepalive
+      peer.timers_data_received
 
       content = Bytes.empty
       ver = pt.unsafe_fetch(0) >> 4
@@ -541,14 +651,12 @@ module Wireguard
       full = bytes.dup
       peer.cookie_generator.add_macs(full)
       peer.tx_bytes &+= full.size
-      peer.endpoint.try do |ep|
+      peer.current_endpoint.try do |ep|
         @bind.try(&.send(ep, full))
       end
     end
 
-    def send_transport(peer : Peer, content : Bytes) : Nil
-      kp = peer.current_keypair
-      raise "no keypair" unless kp
+    def send_transport(peer : Peer, content : Bytes, kp : Keypair) : Nil
       nonce_counter = kp.send_nonce
       kp.send_nonce &+= 1
 
@@ -571,9 +679,14 @@ module Wireguard
         kp.send_key, nonce, pt[0, padded_len], nil)
 
       peer.tx_bytes &+= packet.size
-      peer.endpoint.try do |ep|
+      peer.timers_any_authenticated_packet_traversal
+      peer.timers_any_authenticated_packet_sent
+      peer.current_endpoint.try do |ep|
         @bind.try(&.send(ep, packet))
       end
+      # keepalive-sized packets don't push the rekey/new-handshake timers
+      peer.timers_data_sent if content.size > 0
+      peer.keep_key_fresh_sending
     end
   end
 
@@ -582,8 +695,15 @@ module Wireguard
     getter remote_static : Bytes
     getter precomputed_static_static : Bytes = Bytes.new(32)
     property preshared_key : Bytes = Bytes.new(32)
+    # configured endpoint (UAPI) and the address learned from authenticated
+    # packets (roaming); retransmits clear the learned source
     property endpoint : String?
+    property endpoint_src : String? = nil
     property running : Bool = false
+
+    def current_endpoint : String?
+      @endpoint_src || @endpoint
+    end
 
     # handshake state
     property state : Symbol = :zeroed
@@ -595,6 +715,7 @@ module Wireguard
     property remote_ephemeral : Bytes = Bytes.new(32)
     property last_timestamp : Bytes = Bytes.new(Tai64n::TIMESTAMP_SIZE)
     property last_initiation_consumption : Time::Span = Time.monotonic - 2.seconds
+    @last_sent_handshake_at : Time::Span = Time.monotonic - 1.hour
 
     # keypairs
     property current_keypair : Keypair?
@@ -605,6 +726,10 @@ module Wireguard
     @staged : Array(Bytes) = [] of Bytes
     property tx_bytes : UInt64 = 0
     property rx_bytes : UInt64 = 0
+    # configured allowed ips as given (for the UAPI get operation)
+    property allowed_ips : Array(String) = [] of String
+    # wall-clock nanoseconds of the last completed handshake (0 = never)
+    property last_handshake_unix_nano : Int64 = 0
 
     getter cookie_generator = CookieGenerator.new
 
@@ -614,7 +739,92 @@ module Wireguard
 
     def start : Nil
       @running = true
+      # allow an immediate handshake, like Go Peer.Start
+      @last_sent_handshake_at = Time.monotonic - (REKEY_TIMEOUT + 1.second)
+      start_timers
     end
+
+    def stop : Nil
+      @running = false
+      timers_stop
+    end
+
+    # ---------------------------------------------------------- keypairs
+
+    # Insert a freshly derived keypair (wireguard-go Keypairs.insert).
+    def insert_keypair(kp : Keypair) : Nil
+      if kp.initiator?
+        drop_keypair(@previous_keypair) if @previous_keypair
+        @previous_keypair = @current_keypair
+        @current_keypair = kp
+        @next_keypair = nil
+      else
+        drop_keypair(@next_keypair) if @next_keypair
+        @next_keypair = kp
+        @previous_keypair = nil
+      end
+    end
+
+    # Remove a keypair from the index table and zero its keys.
+    def drop_keypair(kp : Keypair?) : Nil
+      return unless kp
+      @device.delete_index(kp.local_index)
+      kp.zero!
+      @current_keypair = nil if @current_keypair == kp
+      @previous_keypair = nil if @previous_keypair == kp
+      @next_keypair = nil if @next_keypair == kp
+    end
+
+    # Zero handshake state (wireguard-go Handshake.Clear).
+    private def handshake_clear : Nil
+      @local_ephemeral.fill(0)
+      @remote_ephemeral.fill(0)
+      @handshake_chain_key.fill(0)
+      @handshake_hash.fill(0)
+      @local_index = 0
+      @state = :zeroed
+    end
+
+    # Invalidate current sessions after a key rotation (Go ExpireCurrentKeypairs):
+    # also drop the pending handshake index and release the initiation guard,
+    # so a fresh handshake starts immediately.
+    def expire_current_keypairs : Nil
+      @device.delete_index(@local_index)
+      handshake_clear
+      @last_sent_handshake_at = Time.monotonic - (REKEY_TIMEOUT + 1.second)
+      @current_keypair.try { |kp| kp.send_nonce = Keypair::REJECT_AFTER_MESSAGES }
+      @next_keypair.try { |kp| kp.send_nonce = Keypair::REJECT_AFTER_MESSAGES }
+    end
+
+    # Zero all key material and drop staged packets (Go ZeroAndFlushAll).
+    def zero_and_flush_all : Nil
+      drop_keypair(@current_keypair)
+      drop_keypair(@previous_keypair)
+      drop_keypair(@next_keypair)
+      @device.delete_index(@local_index)
+      handshake_clear
+      @staged.clear
+    end
+
+    # Full teardown on peer removal.
+    def stop_and_cleanup : Nil
+      stop
+      zero_and_flush_all
+      @preshared_key.fill(0)
+      @endpoint_src = nil
+    end
+
+    # Promote next -> current on first authenticated packet of the session.
+    def received_with_keypair(kp : Keypair) : Bool
+      return false unless @next_keypair == kp
+      drop_keypair(@previous_keypair)
+      @previous_keypair = @current_keypair
+      @current_keypair = @next_keypair
+      @next_keypair = nil
+      true
+    end
+
+    # ------------------------------------------------------------ sending
 
     def stage_packet(packet : Bytes) : Nil
       @staged << packet.dup
@@ -622,40 +832,68 @@ module Wireguard
     end
 
     def send_staged : Nil
-      return if @staged.empty?
+      return if @staged.empty? || !@device.up
       kp = current_keypair
+      kp = nil if kp && !kp.sendable?
       if kp.nil?
-        # like wireguard-go: don't re-initiate while a handshake is in flight
-        send_handshake_initiation if state == :zeroed
+        # no valid keypair: (re-)initiate; retries are paced by the
+        # retransmit timer and the RekeyTimeout send guard
+        send_handshake_initiation
         return
       end
       while packet = @staged.shift?
-        @device.send_transport(self, packet)
+        unless kp.sendable?
+          @staged.unshift(packet)
+          send_handshake_initiation
+          return
+        end
+        @device.send_transport(self, packet, kp)
       end
     end
 
-    def send_handshake_initiation : Nil
+    def send_handshake_initiation(retry : Bool = false) : Nil
+      unless retry
+        @handshake_attempts = 0
+      end
+      # at most one initiation per RekeyTimeout, like SendHandshakeInitiation
+      return if (Time.monotonic - @last_sent_handshake_at) < REKEY_TIMEOUT
+      @last_sent_handshake_at = Time.monotonic
+
       msg = @device.create_message_initiation(self)
       return unless msg
+      timers_any_authenticated_packet_traversal
+      timers_any_authenticated_packet_sent
       @device.send_handshake_message(self, msg.marshal)
+      timers_handshake_initiated
     end
 
     def flush_staged : Nil
       send_staged
     end
 
-    def send_keepalive_if_idle : Nil
-      return unless @staged.empty? && @running
-      @staged << Bytes.empty
+    # Stage a keepalive if nothing else is queued, then send (Go SendKeepalive).
+    def send_keepalive : Nil
+      @staged << Bytes.empty if @staged.empty? && @running
       send_staged
     end
 
-    def received_with_keypair(kp : Keypair) : Bool
-      return false unless @next_keypair == kp
-      @previous_keypair = @current_keypair
-      @current_keypair = @next_keypair
-      @next_keypair = nil
-      true
+    # Rekey triggers (Go keepKeyFreshSending / keepKeyFreshReceiving).
+    def keep_key_fresh_sending : Nil
+      kp = current_keypair
+      return unless kp
+      if kp.send_nonce > Keypair::REKEY_AFTER_MESSAGES ||
+         (kp.initiator? && Time.monotonic - kp.created_at > Keypair::REKEY_AFTER_TIME)
+        send_handshake_initiation
+      end
+    end
+
+    def keep_key_fresh_receiving : Nil
+      kp = current_keypair
+      return unless kp
+      if kp.initiator? &&
+         Time.monotonic - kp.created_at > (Keypair::REJECT_AFTER_TIME - KEEPALIVE_TIMEOUT - REKEY_TIMEOUT)
+        send_handshake_initiation
+      end
     end
   end
 end

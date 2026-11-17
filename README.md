@@ -6,7 +6,7 @@ implementation vendored as an **oracle** and verified against it via
 [twinshot](https://github.com/ruby/twinshot) snapshot (differential) testing.
 
 ```
-✓ 10/10 snapshots — 1:1 parity with wireguard-go (twinshot review)
+✓ 11/11 snapshots — 1:1 parity with wireguard-go (twinshot review)
 ```
 
 ## Layout
@@ -41,14 +41,32 @@ implementation vendored as an **oracle** and verified against it via
 - **Rate limiter** — token-bucket handshake flood protection.
 - **Device/Peer** — in-process device with a channel-based mem bind and
   tun channels (the same topology wireguard-go's own tests use via
-  `tuntest.ChannelTUN` + a channel bind).
+  `tuntest.ChannelTUN` + a channel bind), keypair expiry
+  (`REJECT_AFTER_TIME`/`REJECT_AFTER_MESSAGES`), random receiver indexes,
+  key rotation (`ExpireCurrentKeypairs` semantics), roaming endpoints, and
+  constant-time MAC comparison.
+- **Timers** — the full wireguard-go timer state machine (port of
+  `timers.go`): handshake retransmission with backoff and give-up, rekey on
+  traffic/messages, keepalives, persistent keepalive, and zero-key-material
+  destruction.
+- **Under-load cookies** — MAC2 checking, cookie replies, and the handshake
+  rate limiter wired into the device receive path.
 - **UAPI** — the configuration subset needed for `private_key`,
   `public_key`, `preshared_key`, `endpoint`, `allowed_ip`, `remove`,
-  `replace_peers`, plus a deterministic `ipc_get`.
+  `replace_peers`, `update_only`, `replace_allowed_ips`,
+  `persistent_keepalive_interval`, plus a `wg`-compatible `ipc_get`
+  (private key, listen port, fwmark, full per-peer dump with handshake
+  times and allowed ips).
+- **Real transports** — `UdpBind`: dual-stack IPv6/IPv4 UDP socket with
+  recvmmsg/sendmmsg batching; `TunDevice`: Linux TUN interface
+  (`/dev/net/tun`, `IFF_TUN|IFF_NO_PI`) bridged to the device channels.
+- **UAPI socket + CLI** — `UapiServer`: the xplatform configuration
+  protocol over a unix socket (the wire format `wg` speaks);
+  `bin/wg-cr`: `show`/`set`/`genkey`/`pubkey` against that socket.
 
 ## Differential testing with twinshot
 
-Both harnesses run the same ten deterministic scenarios and print the same
+Both harnesses run the same eleven deterministic scenarios and print the same
 files; `twinshot` then requires line-for-line parity:
 
 | Snapshot            | Scenario                                                    |
@@ -64,6 +82,8 @@ files; `twinshot` then requires line-for-line parity:
 | `09_ratelimiter`    | handshake flood bucket                                      |
 | `10_transport`      | two devices end-to-end: handshake over a mem bind, data both |
 |                     | directions, padding, byte counters — all byte-identical     |
+| `11_uapi`           | UAPI lifecycle: peer remove (routing cleanup), update_only, |
+|                     | peer re-add, and private-key rotation with re-handshake     |
 
 Random inputs (ephemeral keys, cookie secrets/nonces) are never printed, so
 the parity surface is fully deterministic.
@@ -89,6 +109,23 @@ dev.start
 dev.tun.outbound.send(ip_packet)   # OS → device
 packet = dev.tun.inbound.receive   # device → OS
 ```
+
+Running against real sockets (Linux): a dual-stack UDP bind, a TUN
+interface, and a `wg`-compatible UAPI socket:
+
+```crystal
+dev = Wireguard::Device.new("wgcr0")
+dev.attach_bind(Wireguard::UdpBind.new(51820, "wgcr0"))
+dev.attach_tun(Wireguard::TunDevice.new("wgcr0").tap(&.start))
+Wireguard::UapiServer.new(dev, "/var/run/wireguard/wgcr0.sock").start
+dev.start
+```
+
+Then `bin/wg-cr show /var/run/wireguard/wgcr0.sock` (or the system `wg`)
+configures and inspects the device. Smoke tests for these paths:
+`tools/smoke_udp.cr` (loopback handshake over IPv6 and IPv4),
+`tools/smoke_uapi.cr` (socket protocol + CLI), `tools/smoke_tun.cr`
+(skips without CAP_NET_ADMIN).
 
 ## Requirements
 
@@ -163,11 +200,10 @@ Reading it:
 
 ## Roadmap (not yet ported)
 
-- Retransmission/rekey/keepalive **timers** (currently handshakes are
-  triggered by queued data, like the oracle test path)
-- Real UDP bind and TUN device plumbing (Linux)
-- UAPI socket and `wg`-compatible CLI
-- Under-load cookie flow through the device receive path
+- Interface/address/route management (link up, addresses — `ip` tooling's
+  job in wg-quick terms) and re-binding the socket on `listen_port` changes
+- Retransmission is covered by the timer state machine, but a wg-quick-style
+  launcher script tying TUN + UdpBind + UapiServer together is not shipped
 
 The parity harness is designed to grow with the port: every new capability
 gets a scenario in `harness/main.go`, the identical scenario in
